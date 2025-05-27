@@ -207,15 +207,27 @@ func (c *Config) ToSaramaConfig() (*sarama.Config, error) {
 	// Version (use latest stable)
 	config.Version = sarama.V2_8_1_0
 
+	// Debug: Print current configuration values
+	fmt.Printf("DEBUG: ProducerIdempotent = %v\n", c.ProducerIdempotent)
+	fmt.Printf("DEBUG: ProducerRequiredAcks = %s\n", c.ProducerRequiredAcks)
+	fmt.Printf("DEBUG: Before - config.Producer.RequiredAcks = %d\n", config.Producer.RequiredAcks)
+	fmt.Printf("DEBUG: Before - config.Net.MaxOpenRequests = %d\n", config.Net.MaxOpenRequests)
+
 	// Idempotent producer requirements
 	if c.ProducerIdempotent {
 		// Idempotent producer requires RequiredAcks to be WaitForAll
 		if config.Producer.RequiredAcks != sarama.WaitForAll {
+			fmt.Printf("DEBUG: Changing RequiredAcks from %d to %d (WaitForAll)\n", config.Producer.RequiredAcks, sarama.WaitForAll)
 			config.Producer.RequiredAcks = sarama.WaitForAll
 		}
 		// Idempotent producer requires Net.MaxOpenRequests to be 1
+		fmt.Printf("DEBUG: Setting Net.MaxOpenRequests from %d to 1\n", config.Net.MaxOpenRequests)
 		config.Net.MaxOpenRequests = 1
 	}
+
+	fmt.Printf("DEBUG: After - config.Producer.RequiredAcks = %d\n", config.Producer.RequiredAcks)
+	fmt.Printf("DEBUG: After - config.Net.MaxOpenRequests = %d\n", config.Net.MaxOpenRequests)
+	fmt.Printf("DEBUG: After - config.Producer.Idempotent = %v\n", config.Producer.Idempotent)
 
 	return config, nil
 }
