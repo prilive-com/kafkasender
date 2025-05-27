@@ -32,6 +32,10 @@ type KafkaProducer struct {
 	metricsLock  sync.RWMutex
 	healthLock   sync.RWMutex
 
+	// Sync operation tracking (Option 2: Separate Channels + Option 3: Message ID Tracking)
+	syncPendingMessages map[string]chan MessageResult // messageID -> result channel
+	syncMutex          sync.RWMutex
+
 	// Lifecycle management
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -105,17 +109,18 @@ func NewProducer(config *Config, options *ProducerOptions) (*KafkaProducer, erro
 	}
 
 	kafkaProducer := &KafkaProducer{
-		producer:       producer,
-		config:         config,
-		logger:         logger,
-		circuitBreaker: circuitBreaker,
-		rateLimiter:    rateLimiter,
-		metrics:        metrics,
-		health:         health,
-		ctx:            ctx,
-		cancel:         cancel,
-		startTime:      startTime,
-		options:        options,
+		producer:            producer,
+		config:              config,
+		logger:              logger,
+		circuitBreaker:      circuitBreaker,
+		rateLimiter:         rateLimiter,
+		metrics:             metrics,
+		health:              health,
+		syncPendingMessages: make(map[string]chan MessageResult),
+		ctx:                 ctx,
+		cancel:              cancel,
+		startTime:           startTime,
+		options:             options,
 	}
 
 	// Start background goroutines
@@ -244,35 +249,42 @@ func (p *KafkaProducer) sendMessageInternal(ctx context.Context, topic string, k
 	}, nil
 }
 
-// waitForDelivery waits for message delivery confirmation
+// waitForDelivery waits for message delivery confirmation using dedicated channels
 func (p *KafkaProducer) waitForDelivery(ctx context.Context, messageID string, topic string, key string, startTime time.Time) (MessageMetadata, error) {
+	// Create dedicated channel for this sync operation (Option 2: Separate Channels)
+	resultChan := make(chan MessageResult, 1)
+	
+	// Register this sync operation (Option 3: Message ID Tracking)
+	p.syncMutex.Lock()
+	p.syncPendingMessages[messageID] = resultChan
+	p.syncMutex.Unlock()
+	
+	// Cleanup when done
+	defer func() {
+		p.syncMutex.Lock()
+		delete(p.syncPendingMessages, messageID)
+		p.syncMutex.Unlock()
+		close(resultChan)
+	}()
+
 	timeout := time.After(p.config.ProducerTimeout)
 
-	for {
-		select {
-		case success := <-p.producer.Successes():
-			if success.Metadata == messageID {
-				metadata := MessageMetadata{
-					Topic:     success.Topic,
-					Partition: success.Partition,
-					Offset:    success.Offset,
-					Key:       key,
-					Timestamp: success.Timestamp,
-				}
-				p.logger.LogMessageSent(metadata, time.Since(startTime))
-				return metadata, nil
-			}
-		case err := <-p.producer.Errors():
-			if err.Msg.Metadata == messageID {
-				duration := time.Since(startTime)
-				p.logger.LogMessageFailed(topic, key, err.Err, duration)
-				return MessageMetadata{}, fmt.Errorf("message delivery failed: %w", err.Err)
-			}
-		case <-ctx.Done():
-			return MessageMetadata{}, fmt.Errorf("context cancelled while waiting for delivery")
-		case <-timeout:
-			return MessageMetadata{}, fmt.Errorf("timeout waiting for delivery confirmation")
+	select {
+	case result := <-resultChan:
+		if result.Error != nil {
+			duration := time.Since(startTime)
+			p.logger.LogMessageFailed(topic, key, result.Error, duration)
+			return MessageMetadata{}, fmt.Errorf("message delivery failed: %w", result.Error)
 		}
+		if result.Metadata != nil {
+			p.logger.LogMessageSent(*result.Metadata, time.Since(startTime))
+			return *result.Metadata, nil
+		}
+		return MessageMetadata{}, fmt.Errorf("received invalid result")
+	case <-ctx.Done():
+		return MessageMetadata{}, fmt.Errorf("context cancelled while waiting for delivery")
+	case <-timeout:
+		return MessageMetadata{}, fmt.Errorf("timeout waiting for delivery confirmation")
 	}
 }
 
@@ -315,27 +327,50 @@ func (p *KafkaProducer) Health() HealthStatus {
 	return status
 }
 
-// startBackgroundWorkers starts goroutines for handling async operations
+// startBackgroundWorkers starts goroutines for message routing and handling
 func (p *KafkaProducer) startBackgroundWorkers() {
-	// Success handler
+	// Message Router - handles both sync and async operations (Options 2 + 3)
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
 		for {
 			select {
 			case success := <-p.producer.Successes():
-				if p.options.AsyncMode {
-					p.updateMetricsOnSuccess(0) // We don't track duration in async mode
-					p.updateHealthOnSuccess()
-					
-					if p.options.SuccessHandler != nil {
-						metadata := MessageMetadata{
-							Topic:     success.Topic,
-							Partition: success.Partition,
-							Offset:    success.Offset,
-							Timestamp: success.Timestamp,
+				messageID := success.Metadata.(string)
+				
+				// Check if this is a sync operation (Option 3: Message ID Tracking)
+				p.syncMutex.RLock()
+				syncChan, isSyncOperation := p.syncPendingMessages[messageID]
+				p.syncMutex.RUnlock()
+				
+				if isSyncOperation {
+					// Route to sync channel (Option 2: Separate Channels)
+					metadata := MessageMetadata{
+						Topic:     success.Topic,
+						Partition: success.Partition,
+						Offset:    success.Offset,
+						Timestamp: success.Timestamp,
+					}
+					select {
+					case syncChan <- MessageResult{Success: true, Metadata: &metadata, Error: nil}:
+					case <-p.ctx.Done():
+						return
+					}
+				} else {
+					// Handle async operation
+					if p.options.AsyncMode {
+						p.updateMetricsOnSuccess(0)
+						p.updateHealthOnSuccess()
+						
+						if p.options.SuccessHandler != nil {
+							metadata := MessageMetadata{
+								Topic:     success.Topic,
+								Partition: success.Partition,
+								Offset:    success.Offset,
+								Timestamp: success.Timestamp,
+							}
+							p.options.SuccessHandler(metadata)
 						}
-						p.options.SuccessHandler(metadata)
 					}
 				}
 			case <-p.ctx.Done():
@@ -344,19 +379,36 @@ func (p *KafkaProducer) startBackgroundWorkers() {
 		}
 	}()
 
-	// Error handler
+	// Error Router - handles both sync and async error operations
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
 		for {
 			select {
 			case err := <-p.producer.Errors():
-				if p.options.AsyncMode {
-					p.updateMetricsOnError()
-					p.updateHealthOnError(err.Err)
-					
-					if p.options.ErrorHandler != nil {
-						p.options.ErrorHandler(err.Err)
+				messageID := err.Msg.Metadata.(string)
+				
+				// Check if this is a sync operation (Option 3: Message ID Tracking)
+				p.syncMutex.RLock()
+				syncChan, isSyncOperation := p.syncPendingMessages[messageID]
+				p.syncMutex.RUnlock()
+				
+				if isSyncOperation {
+					// Route to sync channel (Option 2: Separate Channels)
+					select {
+					case syncChan <- MessageResult{Success: false, Metadata: nil, Error: err.Err}:
+					case <-p.ctx.Done():
+						return
+					}
+				} else {
+					// Handle async operation
+					if p.options.AsyncMode {
+						p.updateMetricsOnError()
+						p.updateHealthOnError(err.Err)
+						
+						if p.options.ErrorHandler != nil {
+							p.options.ErrorHandler(err.Err)
+						}
 					}
 				}
 			case <-p.ctx.Done():
