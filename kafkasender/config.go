@@ -207,6 +207,16 @@ func (c *Config) ToSaramaConfig() (*sarama.Config, error) {
 	// Version (use latest stable)
 	config.Version = sarama.V2_8_1_0
 
+	// Idempotent producer requirements
+	if c.ProducerIdempotent {
+		// Idempotent producer requires RequiredAcks to be WaitForAll
+		if config.Producer.RequiredAcks != sarama.WaitForAll {
+			config.Producer.RequiredAcks = sarama.WaitForAll
+		}
+		// Idempotent producer requires Net.MaxOpenRequests to be 1
+		config.Net.MaxOpenRequests = 1
+	}
+
 	return config, nil
 }
 
