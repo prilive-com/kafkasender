@@ -319,6 +319,43 @@ options.MetricsHandler = func(metrics kafkasender.ProducerMetrics) {
 4. Ensure all tests pass
 5. Submit a pull request
 
+## 📋 Changelog
+
+### v1.1.0 (2025-05-27) - Critical Sync Mode Fix
+
+**🐛 Fixed Race Condition in Synchronous Mode**
+
+**Problem**: The library had a critical race condition where synchronous and asynchronous operations competed for the same success/error channels from the Kafka producer. This caused:
+- `timeout waiting for delivery confirmation` errors in sync mode
+- Unreliable acknowledgments even with correct Kafka configurations
+- Users forced to use async mode to work around the issue
+
+**Solution**: Implemented dual-channel architecture with message ID tracking:
+
+#### **Option 2: Separate Channels**
+- **Sync operations**: Use dedicated `chan MessageResult` per message
+- **Async operations**: Use background workers with SuccessHandler/ErrorHandler callbacks
+- **No conflicts**: Each mode has independent communication channels
+
+#### **Option 3: Message ID Tracking**
+- **Smart message router**: Background goroutines route success/error messages by message ID
+- **Sync registry**: `syncPendingMessages` map tracks pending synchronous operations
+- **Thread-safe routing**: Messages delivered to correct channel based on operation type
+
+**Impact**:
+- ✅ **Synchronous mode now works reliably** with proper acknowledgments
+- ✅ **Asynchronous mode unchanged** - maintains existing performance
+- ✅ **Both modes can coexist** in same application
+- ✅ **Production-ready** - eliminates race conditions that caused timeouts
+
+**Breaking Changes**: None - API remains fully backward compatible
+
+**Testing**: Verified with single-node Kafka using SASL_PLAINTEXT authentication and `WaitForLocal` acknowledgments.
+
+**Credits**: Fix developed in collaboration with user feedback during production deployment troubleshooting.
+
+---
+
 ## 📄 License
 
 MIT © 2025 Prilive Com

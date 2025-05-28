@@ -224,6 +224,11 @@ func (p *KafkaProducer) sendMessageInternal(ctx context.Context, topic string, k
 	// Add metadata for tracking
 	messageID := p.generateMessageID()
 	saramaMessage.Metadata = messageID
+	
+	// Debug logging for sync operations
+	if !p.options.AsyncMode {
+		p.logger.Info("KAFKASENDER: Sending sync message", "message_id", messageID, "topic", topic, "key", key)
+	}
 
 	// Send message (async)
 	select {
@@ -258,6 +263,9 @@ func (p *KafkaProducer) waitForDelivery(ctx context.Context, messageID string, t
 	p.syncMutex.Lock()
 	p.syncPendingMessages[messageID] = resultChan
 	p.syncMutex.Unlock()
+	
+	// Debug logging
+	p.logger.Info("KAFKASENDER: Registered sync operation", "message_id", messageID, "pending_count", len(p.syncPendingMessages))
 	
 	// Cleanup when done
 	defer func() {
@@ -336,19 +344,32 @@ func (p *KafkaProducer) startBackgroundWorkers() {
 		for {
 			select {
 			case success := <-p.producer.Successes():
-				messageID := success.Metadata.(string)
+				// Safe type assertion for messageID
+				messageID, ok := success.Metadata.(string)
+				if !ok {
+					p.logger.Error("Invalid message metadata type", "metadata", success.Metadata, "type", fmt.Sprintf("%T", success.Metadata))
+					continue
+				}
+				
+				// Debug logging
+				p.logger.Info("KAFKASENDER: Received success", "message_id", messageID, "topic", success.Topic, "partition", success.Partition, "offset", success.Offset)
 				
 				// Check if this is a sync operation (Option 3: Message ID Tracking)
 				p.syncMutex.RLock()
 				syncChan, isSyncOperation := p.syncPendingMessages[messageID]
 				p.syncMutex.RUnlock()
 				
+				// Debug logging
+				p.logger.Info("KAFKASENDER: Sync operation check", "message_id", messageID, "is_sync", isSyncOperation)
+				
 				if isSyncOperation {
 					// Route to sync channel (Option 2: Separate Channels)
+					keyBytes, _ := success.Key.Encode()
 					metadata := MessageMetadata{
 						Topic:     success.Topic,
 						Partition: success.Partition,
 						Offset:    success.Offset,
+						Key:       string(keyBytes),
 						Timestamp: success.Timestamp,
 					}
 					select {
@@ -357,20 +378,21 @@ func (p *KafkaProducer) startBackgroundWorkers() {
 						return
 					}
 				} else {
-					// Handle async operation
-					if p.options.AsyncMode {
-						p.updateMetricsOnSuccess(0)
-						p.updateHealthOnSuccess()
-						
-						if p.options.SuccessHandler != nil {
-							metadata := MessageMetadata{
-								Topic:     success.Topic,
-								Partition: success.Partition,
-								Offset:    success.Offset,
-								Timestamp: success.Timestamp,
-							}
-							p.options.SuccessHandler(metadata)
+					// Handle non-sync operation (always update metrics)
+					p.updateMetricsOnSuccess(0)
+					p.updateHealthOnSuccess()
+					
+					// Only call SuccessHandler if in async mode
+					if p.options.AsyncMode && p.options.SuccessHandler != nil {
+						keyBytes, _ := success.Key.Encode()
+						metadata := MessageMetadata{
+							Topic:     success.Topic,
+							Partition: success.Partition,
+							Offset:    success.Offset,
+							Key:       string(keyBytes),
+							Timestamp: success.Timestamp,
 						}
+						p.options.SuccessHandler(metadata)
 					}
 				}
 			case <-p.ctx.Done():
@@ -386,7 +408,12 @@ func (p *KafkaProducer) startBackgroundWorkers() {
 		for {
 			select {
 			case err := <-p.producer.Errors():
-				messageID := err.Msg.Metadata.(string)
+				// Safe type assertion for messageID
+				messageID, ok := err.Msg.Metadata.(string)
+				if !ok {
+					p.logger.Error("Invalid error message metadata type", "metadata", err.Msg.Metadata, "error", err.Err)
+					continue
+				}
 				
 				// Check if this is a sync operation (Option 3: Message ID Tracking)
 				p.syncMutex.RLock()
@@ -401,14 +428,13 @@ func (p *KafkaProducer) startBackgroundWorkers() {
 						return
 					}
 				} else {
-					// Handle async operation
-					if p.options.AsyncMode {
-						p.updateMetricsOnError()
-						p.updateHealthOnError(err.Err)
-						
-						if p.options.ErrorHandler != nil {
-							p.options.ErrorHandler(err.Err)
-						}
+					// Handle non-sync operation (always update metrics)
+					p.updateMetricsOnError()
+					p.updateHealthOnError(err.Err)
+					
+					// Only call ErrorHandler if in async mode
+					if p.options.AsyncMode && p.options.ErrorHandler != nil {
+						p.options.ErrorHandler(err.Err)
 					}
 				}
 			case <-p.ctx.Done():
